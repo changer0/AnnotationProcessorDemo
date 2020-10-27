@@ -1,5 +1,6 @@
 package com.lulu.lib_compiler;
 
+import com.lulu.lib_annotations.BindView;
 import com.lulu.lib_annotations.ByteService;
 import com.squareup.javapoet.ClassName;
 import com.squareup.javapoet.FieldSpec;
@@ -10,7 +11,12 @@ import com.squareup.javapoet.TypeName;
 import com.squareup.javapoet.TypeSpec;
 import com.squareup.javapoet.TypeVariableName;
 
+import org.jetbrains.annotations.Nullable;
+
 import java.io.IOException;
+import java.io.PrintWriter;
+import java.io.StringWriter;
+import java.lang.annotation.Annotation;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -24,16 +30,21 @@ import javax.annotation.processing.ProcessingEnvironment;
 import javax.annotation.processing.RoundEnvironment;
 import javax.lang.model.SourceVersion;
 import javax.lang.model.element.Element;
+import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.Modifier;
+import javax.lang.model.element.Name;
 import javax.lang.model.element.TypeElement;
+import javax.lang.model.type.DeclaredType;
 import javax.lang.model.type.MirroredTypeException;
+import javax.lang.model.type.TypeKind;
 import javax.lang.model.type.TypeMirror;
-import javax.tools.Diagnostic;
+
 
 public class ByteProcessor extends AbstractProcessor {
     private Filer filer;//用于生成新的java文件的对象
     private Messager messager;//用于输出log的对象
     private Map<String, String> mapper = new HashMap<>();
+    private long time;
 
     @Override
     public synchronized void init(ProcessingEnvironment processingEnvironment) {
@@ -54,11 +65,18 @@ public class ByteProcessor extends AbstractProcessor {
      */
     @Override
     public boolean process(Set<? extends TypeElement> annotations, RoundEnvironment roundEnvironment) {
+        handleByteService(roundEnvironment);
+        handleBindView(roundEnvironment);
+        return true;
+    }
+
+    private void handleByteService(RoundEnvironment roundEnvironment) {
         //获取该注解的元素
         Set<? extends Element> sets = roundEnvironment.getElementsAnnotatedWith(ByteService.class);
 
         if (sets != null && sets.size() > 0) {
-            System.out.println("将要处理：" + sets);
+            Logger.println("将要处理 ByteService 注解：" + sets);
+            time = System.currentTimeMillis();
             for (Element element : sets) {
                 //每一个元素由于只能是类，所以都是TypeElement类型
                 if (element instanceof TypeElement) {
@@ -82,13 +100,23 @@ public class ByteProcessor extends AbstractProcessor {
                     //放入map中后续生成代码
                     mapper.put(interName, implName);
                     //messager输出log
-                    messager.printMessage(Diagnostic.Kind.NOTE, "保存：Interface: " + interName + " Impl: " + implName);
+                    //messager.printMessage(Diagnostic.Kind.NOTE, "保存：Interface: " + interName + " Impl: " + implName);
+                    Logger.println("保存：Interface: " + interName + " Impl: " + implName);
                 }
             }
             //生成代码
             generate();
+            Logger.println("总耗时：" + (System.currentTimeMillis()-time)/1000f+ " s");
         }
-        return true;
+    }
+
+    private @Nullable
+    TypeElement getSuperClass(TypeElement typeElement) {
+        TypeMirror type = typeElement.getSuperclass();
+        if (type.getKind() == TypeKind.NONE) {
+            return null;
+        }
+        return (TypeElement) ((DeclaredType) type).asElement();
     }
 
     /**
@@ -158,4 +186,92 @@ public class ByteProcessor extends AbstractProcessor {
     public SourceVersion getSupportedSourceVersion() {
         return SourceVersion.latestSupported();
     }
+
+    public static void error(Element element, String msg, Object... formatStr) {
+        System.out.println(Logger.TAG + String.format(msg, (Object) formatStr));
+    }
+
+
+    private void handleBindView(RoundEnvironment roundEnvironment) {
+        //获取该注解的元素
+        Set<? extends Element> sets = roundEnvironment.getElementsAnnotatedWith(BindView.class);
+        if (sets == null || sets.size() <= 0) {
+            return;
+        }
+        for (Element element : sets) {
+            TypeElement enclosingElement = (TypeElement) element.getEnclosingElement();
+            Logger.println("正在 handleBindView 注解：" + enclosingElement + "\n"
+                    + "enclosingElement.getSimpleName() : " + enclosingElement.getSimpleName() + "\n"
+                    + "enclosingElement.getQualifiedName() : " + enclosingElement.getQualifiedName() + "\n"
+                    + "enclosingElement.getNestingKind() : " + enclosingElement.getNestingKind() + "\n"
+            );
+        }
+    }
+
+
+    /**
+     * 做开放新检查
+     * @param annotationClass
+     * @param targetThing
+     * @param element
+     * @return
+     */
+    private boolean isInaccessibleViaGeneratedCode(Class<? extends Annotation> annotationClass,
+                                                   String targetThing, Element element) {
+        boolean hasError = false;
+        TypeElement enclosingElement = (TypeElement) element.getEnclosingElement();
+
+        // Verify field or method modifiers.
+        Set<Modifier> modifiers = element.getModifiers();
+        if (modifiers.contains(Modifier.PRIVATE) || modifiers.contains(Modifier.STATIC)) {
+            error(element, "@%s %s must not be private or static. (%s.%s)",
+                    annotationClass.getSimpleName(), targetThing, enclosingElement.getQualifiedName(),
+                    element.getSimpleName());
+            hasError = true;
+        }
+
+        // Verify containing type.
+        if (enclosingElement.getKind() != ElementKind.CLASS) {
+            error(enclosingElement, "@%s %s may only be contained in classes. (%s.%s)",
+                    annotationClass.getSimpleName(), targetThing, enclosingElement.getQualifiedName(),
+                    element.getSimpleName());
+            hasError = true;
+        }
+
+        // Verify containing class visibility is not private.
+        if (enclosingElement.getModifiers().contains(Modifier.PRIVATE)) {
+            error(enclosingElement, "@%s %s may not be contained in private classes. (%s.%s)",
+                    annotationClass.getSimpleName(), targetThing, enclosingElement.getQualifiedName(),
+                    element.getSimpleName());
+            hasError = true;
+        }
+
+        return hasError;
+    }
+
+    /**
+     * 不能乱绑定
+     * @param annotationClass
+     * @param element
+     * @return
+     */
+    private boolean isBindingInWrongPackage(Class<? extends Annotation> annotationClass,
+                                            Element element) {
+        TypeElement enclosingElement = (TypeElement) element.getEnclosingElement();
+        String qualifiedName = enclosingElement.getQualifiedName().toString();
+
+        if (qualifiedName.startsWith("android.")) {
+            error(element, "@%s-annotated class incorrectly in Android framework package. (%s)",
+                    annotationClass.getSimpleName(), qualifiedName);
+            return true;
+        }
+        if (qualifiedName.startsWith("java.")) {
+            error(element, "@%s-annotated class incorrectly in Java framework package. (%s)",
+                    annotationClass.getSimpleName(), qualifiedName);
+            return true;
+        }
+
+        return false;
+    }
+
 }
